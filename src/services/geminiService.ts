@@ -97,7 +97,7 @@ export async function getZoroResponse(prompt: string, history: { sender: "user" 
       return "Internet connection ledhu Manohar. Wi-Fi check chesko!";
     }
     
-    return "Uff, naaku chiraku vasthundi. Server koncham distrub ga undi, Manohar.";
+    return "Hm, small issue Manohar. Malli try chey.";
   }
 }
 

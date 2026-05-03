@@ -185,7 +185,19 @@ export default function App() {
         };
         
         session.onMessage = (sender, text) => {
-          setMessages((prev) => [...prev, { id: Date.now().toString() + "-" + sender, sender, text }]);
+          setMessages((prev) => {
+            const lastMsg = prev[prev.length - 1];
+            // If the last message is from the same sender and was sent recently (within 5 seconds), append to it
+            if (lastMsg && lastMsg.sender === sender && (Date.now() - parseInt(lastMsg.id.split('-')[0])) < 5000) {
+              const updated = [...prev];
+              updated[updated.length - 1] = {
+                ...lastMsg,
+                text: lastMsg.text.endsWith(text) ? lastMsg.text : lastMsg.text + " " + text
+              };
+              return updated;
+            }
+            return [...prev, { id: Date.now().toString() + "-" + sender, sender, text }];
+          });
         };
         
         session.onCommand = (url) => {

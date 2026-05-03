@@ -26,6 +26,7 @@ export class LiveSessionManager {
   private playbackContext: AudioContext | null = null;
   private nextPlayTime: number = 0;
   private isPlaying: boolean = false;
+  private activeChunks: number = 0;
   public isMuted: boolean = false;
   private isTerminated: boolean = false;
   
@@ -45,6 +46,10 @@ export class LiveSessionManager {
 
   async start(history: { sender: "user" | "zoro", text: string }[] = []) {
     const apiKey = process.env.GEMINI_API_KEY;
+    
+    // Safety check: always stop previous sessions before starting a new one
+    this.stop();
+    
     this.isTerminated = false;
     if (!apiKey) {
       console.error("API key missing");
@@ -95,25 +100,31 @@ export class LiveSessionManager {
 
       let silenceCount = 0;
       this.processor.onaudioprocess = (e) => {
-        if (!this.sessionPromise) return;
+        if (!this.sessionPromise || this.isTerminated) return;
+        
+        // If Zoro is speaking, we optionally skip sending audio to avoid echo loops
+        // The Live API has echo cancellation but muting locally is more robust for cheap mics
+        if (this.isPlaying) return;
+
         const inputData = e.inputBuffer.getChannelData(0);
         
-        // Noise Gate
+        // Simple Noise Gate to avoid sending pure static
         let maxAmplitude = 0;
         for (let i = 0; i < inputData.length; i++) {
           const absData = Math.abs(inputData[i]);
           if (absData > maxAmplitude) maxAmplitude = absData;
         }
 
-        const THRESHOLD = 0.008; 
+        const THRESHOLD = 0.005; // Lower threshold to ensure we don't clip the start of words
         if (maxAmplitude < THRESHOLD) {
           silenceCount++;
-          if (silenceCount % 20 !== 0) return;
+          // Send silence periodically to keep the model context alive but not every buffer
+          if (silenceCount > 5) {
+            if (silenceCount % 8 !== 0) return; 
+          }
         } else {
           silenceCount = 0;
         }
-
-        if (this.isTerminated) return;
 
         const pcm16 = new Int16Array(inputData.length);
         for (let i = 0; i < inputData.length; i++) {
@@ -121,15 +132,12 @@ export class LiveSessionManager {
           pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
         }
         
-        const buffer = new ArrayBuffer(pcm16.length * 2);
-        const view = new DataView(buffer);
-        for (let i = 0; i < pcm16.length; i++) {
-          view.setInt16(i * 2, pcm16[i], true);
-        }
-        
-        let binary = '';
+        // Use a more efficient conversion to base64
+        const buffer = pcm16.buffer;
         const bytes = new Uint8Array(buffer);
-        for (let i = 0; i < bytes.byteLength; i++) {
+        let binary = '';
+        const len = bytes.byteLength;
+        for (let i = 0; i < len; i++) {
           binary += String.fromCharCode(bytes[i]);
         }
         const base64Data = btoa(binary);
@@ -138,10 +146,7 @@ export class LiveSessionManager {
           session.sendRealtimeInput({
             audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
           });
-        }).catch(err => {
-          // Only log once to avoid flooding
-          if (silenceCount === 1) console.error("Error sending audio", err);
-        });
+        }).catch(() => {});
       };
 
       this.source.connect(this.processor);
@@ -158,7 +163,7 @@ export class LiveSessionManager {
       const dynamicInstruction = `${systemInstruction}\nCurrent Date and Time (IST): ${currentDateTime}${memoryContext}${memorySummary}\n\nIMPORTANT: Use your Google Search tool for all informational queries. DO NOT open a browser for these. ONLY use 'executeBrowserAction' when Manohar explicitly says "open [website/app]". Speak with a natural, human-like voice, using prosody, emphasis, and occasional conversational fillers to sound less robotic. If Manohar asks you to "remember" something, call the 'rememberFact' tool immediately.`;
 
       this.sessionPromise = this.ai.live.connect({
-        model: "gemini-3.1-flash-live-preview",
+        model: "gemini-2.0-flash-exp",
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
@@ -238,10 +243,18 @@ export class LiveSessionManager {
               this.onStateChange("listening");
             }
 
-            // Handle Transcriptions
-            const userText = message.serverContent?.modelTurn?.parts?.[0]?.text;
-            if (userText) {
-               this.onMessage("zoro", userText);
+            // Handle Transcriptions (Zoro's response text)
+            const modelText = message.serverContent?.modelTurn?.parts?.[0]?.text;
+            if (modelText) {
+               this.onMessage("zoro", modelText);
+            }
+
+            // Handle User Transcriptions (What Zoro thinks Manohar said)
+            const userTranscript = (message as any).serverContent?.inputAudioTranscription?.transcript;
+            if (userTranscript) {
+              console.log("User Transcript:", userTranscript);
+              // We don't necessarily want to push every interim transcript to the chat window 
+              // as it's noisy, but we can log it or show it in a "draft" state.
             }
 
             // Handle Function Calls
@@ -349,13 +362,14 @@ export class LiveSessionManager {
   private async attemptReconnect(history: any) {
     if (this.isTerminated) return;
     this.reconnectAttempts++;
-    console.log(`Reconnecting attempt ${this.reconnectAttempts}...`);
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 10000);
+    console.log(`Reconnecting attempt ${this.reconnectAttempts} in ${delay}ms...`);
     this.stopPlayback();
     if (this.sessionPromise) {
       this.sessionPromise.then(s => s.close()).catch(() => {});
       this.sessionPromise = null;
     }
-    setTimeout(() => this.initSession(history), 1000 * this.reconnectAttempts);
+    setTimeout(() => this.initSession(history), delay);
   }
 
   private playAudioChunk(base64Data: string) {
@@ -398,14 +412,21 @@ export class LiveSessionManager {
       source.start(this.nextPlayTime);
       this.nextPlayTime += audioBuffer.duration;
       this.isPlaying = true;
+      this.activeChunks++;
       
       source.onended = () => {
-        // Only set listening state if we are truly at the end of the scheduled buffer
-        if (this.playbackContext && this.playbackContext.currentTime >= this.nextPlayTime - 0.15) {
-          this.isPlaying = false;
-          if (this.audioContext && !this.isPlaying) {
-            this.onStateChange("listening");
-          }
+        this.activeChunks--;
+        if (this.activeChunks <= 0) {
+          this.activeChunks = 0;
+          
+          // Add a small grace period after speaking before we start listening again
+          // to avoid catching our own echo or room reverb
+          setTimeout(() => {
+            if (this.activeChunks === 0 && !this.isTerminated) {
+              this.isPlaying = false;
+              this.onStateChange("listening");
+            }
+          }, 300);
         }
       };
     } catch (e) {
