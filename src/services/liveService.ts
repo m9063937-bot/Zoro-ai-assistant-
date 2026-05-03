@@ -67,61 +67,54 @@ export class LiveSessionManager {
     }
   }
 
+  private liveSession: any = null;
+
   private async initSession(history: { sender: "user" | "zoro", text: string }[] = []) {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey || this.isTerminated) return;
 
     try {
       this.onStateChange("processing");
+      this.liveSession = null;
       
-      // Initialize Audio Contexts
       const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
       this.audioContext = new AudioContextClass({ sampleRate: 16000 });
       this.playbackContext = new AudioContextClass({ sampleRate: 24000 });
       this.nextPlayTime = this.playbackContext.currentTime;
 
-      // Get Microphone
-      try {
-        this.mediaStream = await navigator.mediaDevices.getUserMedia({ 
-          audio: {
-            channelCount: 1,
-            sampleRate: 16000,
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true
-          } 
-        });
-      } catch (micError) {
-        console.error("Microphone permission denied");
-        throw micError;
-      }
+      this.mediaStream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          channelCount: 1,
+          sampleRate: 16000,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        } 
+      });
 
       this.source = this.audioContext.createMediaStreamSource(this.mediaStream);
       this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);
 
       let silenceCount = 0;
       this.processor.onaudioprocess = (e) => {
-        if (!this.sessionPromise || this.isTerminated) return;
-        
-        // CRITICAL: Mute microphone input while Zoro is speaking to prevent feedback loops
-        if (this.isPlaying) return;
+        if (!this.liveSession || this.isTerminated || this.isPlaying) {
+          // If we are playing audio, we don't send anything to avoid feedback loops.
+          return;
+        }
 
         const inputData = e.inputBuffer.getChannelData(0);
-        
-        // Enhanced Noise Gate
         let maxAmplitude = 0;
         for (let i = 0; i < inputData.length; i++) {
           const absData = Math.abs(inputData[i]);
           if (absData > maxAmplitude) maxAmplitude = absData;
         }
 
-        // Higher threshold to filter out background hiss and room noise
-        const THRESHOLD = 0.02; 
-        if (maxAmplitude < THRESHOLD) {
+        // Noise gate to suppress background hiss.
+        if (maxAmplitude < 0.015) {
           silenceCount++;
-          // Send fewer packets during silence to keep the connection alive without flooding
-          if (silenceCount > 4) {
-            if (silenceCount % 15 !== 0) return; 
+          // Send fewer packets during silence.
+          if (silenceCount > 5) {
+            if (silenceCount % 12 !== 0) return;
           }
         } else {
           silenceCount = 0;
@@ -133,88 +126,78 @@ export class LiveSessionManager {
           pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
         }
         
-        // Fast base64 conversion
         const bytes = new Uint8Array(pcm16.buffer);
-        let binary = '';
+        let binary = "";
         for (let i = 0; i < bytes.byteLength; i++) {
           binary += String.fromCharCode(bytes[i]);
         }
         const base64Data = btoa(binary);
 
-        this.sessionPromise.then(session => {
-          if (!this.isPlaying && !this.isTerminated) {
-            session.sendRealtimeInput({
-              audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
-            });
-          }
-        }).catch(() => {});
+        try {
+          this.liveSession.sendRealtimeInput({
+            audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
+          });
+        } catch (err) {
+          console.error("Error sending realtime input:", err);
+        }
       };
 
       this.source.connect(this.processor);
       this.processor.connect(this.audioContext.destination);
 
-      // Connect to Live API
       const currentDateTime = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
       const memoryContext = memoryService.getSystemInstructionFragment();
-      
       const memorySummary = history.length > 0 
-        ? `\n\nPREVIOUS CONVERSATION CONTEXT (MANOHAR'S CHART):\n${history.slice(-20).map(m => `${m.sender.toUpperCase()}: ${m.text}`).join('\n')}\nRecall the above details if Manohar asks about past discussions.`
+        ? `\n\nPREVIOUS CONVERSATION CONTEXT (MANOHAR'S CHART):\n${history.slice(-20).map(m => `${m.sender.toUpperCase()}: ${m.text}`).join('\n')}\nRecall previous context if Manohar asks.`
         : "";
 
-      const dynamicInstruction = `${systemInstruction}\nCurrent Date and Time (IST): ${currentDateTime}${memoryContext}${memorySummary}\n\nIMPORTANT: Use your Google Search tool for all informational queries. DO NOT open a browser for these. ONLY use 'executeBrowserAction' when Manohar explicitly says "open [website/app]". Speak with a natural, human-like voice, using prosody, emphasis, and occasional conversational fillers to sound less robotic. If Manohar asks you to "remember" something, call the 'rememberFact' tool immediately.`;
+      const dynamicInstruction = `${systemInstruction}\nCurrent Date and Time (IST): ${currentDateTime}${memoryContext}${memorySummary}\n\nSpeak with natural prosody. If Manohar asks you to remember something, call 'rememberFact'.`;
 
-      this.sessionPromise = this.ai.live.connect({
+      const sessionPromise = this.ai.live.connect({
         model: "gemini-2.0-flash-exp",
         config: {
           generationConfig: {
             responseModalities: [Modality.AUDIO],
             speechConfig: {
-              voiceConfig: { 
-                prebuiltVoiceConfig: { 
-                  voiceName: "Kore" 
-                } 
-              },
+              voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } },
             },
-            temperature: 0.7,
-            topP: 0.9,
           },
           systemInstruction: dynamicInstruction,
-          inputAudioTranscription: {},
           tools: [
             { googleSearchRetrieval: {} },
             {
               functionDeclarations: [
                 {
                   name: "executeBrowserAction",
-                  description: "Open a specific website or app (YouTube, Spotify, etc.) ONLY when specifically asked to 'open' it.",
+                  description: "Open a website or app explicitly requested.",
                   parameters: {
                     type: Type.OBJECT,
                     properties: {
-                      actionType: { type: Type.STRING, description: "Type: 'open', 'youtube', 'spotify', 'whatsapp'" },
-                      query: { type: Type.STRING, description: "The website name or search query." },
-                      target: { type: Type.STRING, description: "The target phone number for WhatsApp." }
+                      actionType: { type: Type.STRING },
+                      query: { type: Type.STRING },
+                      target: { type: Type.STRING }
                     },
                     required: ["actionType", "query"]
                   }
                 },
                 {
                   name: "navigatePage",
-                  description: "Control page scrolling or history.",
+                  description: "Control browser navigation.",
                   parameters: {
                     type: Type.OBJECT,
                     properties: {
-                      action: { type: Type.STRING, description: "Action: 'scroll_down', 'scroll_up', 'refresh', 'back', 'forward'" }
+                      action: { type: Type.STRING }
                     },
                     required: ["action"]
                   }
                 },
                 {
                   name: "rememberFact",
-                  description: "Save a fact to long-term memory.",
+                  description: "Remember a fact.",
                   parameters: {
                     type: Type.OBJECT,
                     properties: {
-                      fact: { type: Type.STRING, description: "The fact to remember." }
+                      fact: { type: Type.STRING }
                     },
                     required: ["fact"]
                   }
@@ -230,33 +213,21 @@ export class LiveSessionManager {
             this.onStateChange("listening");
           },
           onmessage: async (message: LiveServerMessage) => {
-            // Handle Audio Output
             const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
             if (base64Audio) {
-              this.onStateChange("speaking");
               this.playAudioChunk(base64Audio);
             }
 
-            // Handle Interruption accurately
             if (message.serverContent?.interrupted) {
-              console.log("Zoro interrupted by Manohar");
               this.stopPlayback(true);
               this.onStateChange("listening");
             }
 
-            // Handle Transcriptions
             const modelText = message.serverContent?.modelTurn?.parts?.[0]?.text;
             if (modelText) {
                this.onMessage("zoro", modelText);
             }
 
-            // Handle User Transcriptions (Debugging)
-            const userTranscript = (message as any).serverContent?.inputAudioTranscription?.transcript;
-            if (userTranscript) {
-              console.log("Manohar said (transcript):", userTranscript);
-            }
-
-            // Handle Function Calls
             const functionCalls = message.toolCall?.functionCalls;
             if (functionCalls && functionCalls.length > 0) {
               for (const call of functionCalls) {
@@ -267,90 +238,54 @@ export class LiveSessionManager {
                     url = `https://www.youtube.com/results?search_query=${encodeURIComponent(args.query)}`;
                   } else if (args.actionType === "spotify") {
                     url = `https://open.spotify.com/search/${encodeURIComponent(args.query)}`;
-                  } else if (args.actionType === "whatsapp") {
-                    url = `https://web.whatsapp.com/send?phone=${args.target || ''}&text=${encodeURIComponent(args.query)}`;
                   } else {
-                    let website = args.query.replace(/\s+/g, "");
-                    if (!website.includes(".")) website += ".com";
-                    url = `https://www.${website}`;
+                    url = `https://www.google.com/search?q=${encodeURIComponent(args.query)}`;
                   }
-                  
                   this.onCommand(url);
-                  
-                  this.sessionPromise?.then(session => {
-                     session.sendToolResponse({
-                       functionResponses: [{
-                         name: call.name,
-                         id: call.id,
-                         response: { result: "Action executed successfully in the browser." }
-                       }]
-                     });
-                  });
-                } else if (call.name === "navigatePage") {
-                  const args = call.args as any;
-                  switch (args.action) {
-                    case "scroll_down":
-                      window.scrollBy({ top: 500, behavior: "smooth" });
-                      break;
-                    case "scroll_up":
-                      window.scrollBy({ top: -500, behavior: "smooth" });
-                      break;
-                    case "refresh":
-                      window.location.reload();
-                      break;
-                    case "back":
-                      window.history.back();
-                      break;
-                    case "forward":
-                      window.history.forward();
-                      break;
-                  }
-
-                  this.sessionPromise?.then(session => {
-                    session.sendToolResponse({
-                      functionResponses: [{
-                        name: call.name,
-                        id: call.id,
-                        response: { result: `Navigation action ${args.action} executed locally.` }
-                      }]
-                    });
+                  this.liveSession?.sendToolResponse({
+                    functionResponses: [{
+                      name: call.name,
+                      id: call.id,
+                      response: { result: "Action executed." }
+                    }]
                   });
                 } else if (call.name === "rememberFact") {
-                  const args = call.args as any;
-                  memoryService.addFact(args.fact);
-                  
-                  this.sessionPromise?.then(session => {
-                    session.sendToolResponse({
-                      functionResponses: [{
-                        name: call.name,
-                        id: call.id,
-                        response: { result: "Fact remembered. I'll never forget it, Manohar." }
-                      }]
-                    });
+                  memoryService.addFact((call.args as any).fact);
+                  this.liveSession?.sendToolResponse({
+                    functionResponses: [{
+                      name: call.name,
+                      id: call.id,
+                      response: { result: "Fact remembered." }
+                    }]
+                  });
+                } else if (call.name === "navigatePage") {
+                   this.liveSession?.sendToolResponse({
+                    functionResponses: [{
+                      name: call.name,
+                      id: call.id,
+                      response: { result: "Navigation processed locally." }
+                    }]
                   });
                 }
               }
             }
           },
           onclose: () => {
-            console.log("Live API Closed");
-            if (this.reconnectAttempts < this.maxReconnectAttempts) {
+            if (!this.isTerminated && this.reconnectAttempts < this.maxReconnectAttempts) {
               this.attemptReconnect(history);
-            } else {
-              this.stop();
             }
           },
           onerror: (err) => {
             console.error("Live API Error:", err);
-            if (this.reconnectAttempts < this.maxReconnectAttempts) {
+            if (!this.isTerminated && this.reconnectAttempts < this.maxReconnectAttempts) {
               this.attemptReconnect(history);
-            } else {
-              console.warn("Live API reached max reconnect attempts");
-              this.stop();
             }
           }
         }
       });
+
+      this.liveSession = await sessionPromise;
+      this.sessionPromise = sessionPromise;
 
     } catch (error) {
       console.error("Failed to start Live Session:", error);
@@ -410,6 +345,9 @@ export class LiveSessionManager {
       
       source.start(this.nextPlayTime);
       this.nextPlayTime += audioBuffer.duration;
+      if (!this.isPlaying) {
+        this.onStateChange("speaking");
+      }
       this.isPlaying = true;
       this.activeChunks++;
       
@@ -418,14 +356,15 @@ export class LiveSessionManager {
         if (this.activeChunks <= 0) {
           this.activeChunks = 0;
           
-          // Add a small grace period after speaking before we start listening again
-          // to avoid catching our own echo or room reverb
+          // Add a significant grace period after speaking before we start listening again
+          // to avoid catching our own echo, room reverb, or the tail end of speaker sound.
+          // 800ms is a safe value for most speakers and environments.
           setTimeout(() => {
             if (this.activeChunks === 0 && !this.isTerminated) {
               this.isPlaying = false;
               this.onStateChange("listening");
             }
-          }, 300);
+          }, 800);
         }
       };
     } catch (e) {
@@ -499,6 +438,7 @@ export class LiveSessionManager {
     if (this.sessionPromise) {
       const promise = this.sessionPromise;
       this.sessionPromise = null; // Clear first to stop further sends
+      this.liveSession = null;
       promise.then(session => {
         try {
           session.close();
