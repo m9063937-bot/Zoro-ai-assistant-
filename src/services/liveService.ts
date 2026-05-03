@@ -88,6 +88,7 @@ export class LiveSessionManager {
             sampleRate: 16000,
             echoCancellation: true,
             noiseSuppression: true,
+            autoGainControl: true
           } 
         });
       } catch (micError) {
@@ -102,25 +103,25 @@ export class LiveSessionManager {
       this.processor.onaudioprocess = (e) => {
         if (!this.sessionPromise || this.isTerminated) return;
         
-        // If Zoro is speaking, we optionally skip sending audio to avoid echo loops
-        // The Live API has echo cancellation but muting locally is more robust for cheap mics
+        // CRITICAL: Mute microphone input while Zoro is speaking to prevent feedback loops
         if (this.isPlaying) return;
 
         const inputData = e.inputBuffer.getChannelData(0);
         
-        // Simple Noise Gate to avoid sending pure static
+        // Enhanced Noise Gate
         let maxAmplitude = 0;
         for (let i = 0; i < inputData.length; i++) {
           const absData = Math.abs(inputData[i]);
           if (absData > maxAmplitude) maxAmplitude = absData;
         }
 
-        const THRESHOLD = 0.005; // Lower threshold to ensure we don't clip the start of words
+        // Higher threshold to filter out background hiss and room noise
+        const THRESHOLD = 0.02; 
         if (maxAmplitude < THRESHOLD) {
           silenceCount++;
-          // Send silence periodically to keep the model context alive but not every buffer
-          if (silenceCount > 5) {
-            if (silenceCount % 8 !== 0) return; 
+          // Send fewer packets during silence to keep the connection alive without flooding
+          if (silenceCount > 4) {
+            if (silenceCount % 15 !== 0) return; 
           }
         } else {
           silenceCount = 0;
@@ -132,20 +133,20 @@ export class LiveSessionManager {
           pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
         }
         
-        // Use a more efficient conversion to base64
-        const buffer = pcm16.buffer;
-        const bytes = new Uint8Array(buffer);
+        // Fast base64 conversion
+        const bytes = new Uint8Array(pcm16.buffer);
         let binary = '';
-        const len = bytes.byteLength;
-        for (let i = 0; i < len; i++) {
+        for (let i = 0; i < bytes.byteLength; i++) {
           binary += String.fromCharCode(bytes[i]);
         }
         const base64Data = btoa(binary);
 
         this.sessionPromise.then(session => {
-          session.sendRealtimeInput({
-            audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
-          });
+          if (!this.isPlaying && !this.isTerminated) {
+            session.sendRealtimeInput({
+              audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
+            });
+          }
         }).catch(() => {});
       };
 
@@ -165,63 +166,62 @@ export class LiveSessionManager {
       this.sessionPromise = this.ai.live.connect({
         model: "gemini-2.0-flash-exp",
         config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: { 
-              prebuiltVoiceConfig: { 
-                voiceName: "Kore" 
-              } 
-            },
-          },
           generationConfig: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: { 
+                prebuiltVoiceConfig: { 
+                  voiceName: "Kore" 
+                } 
+              },
+            },
             temperature: 0.7,
             topP: 0.9,
           },
           systemInstruction: dynamicInstruction,
           inputAudioTranscription: {},
-          outputAudioTranscription: {},
           tools: [
             { googleSearchRetrieval: {} },
             {
               functionDeclarations: [
                 {
                   name: "executeBrowserAction",
-                  description: "Open a specific website or app (YouTube, Spotify, etc.) ONLY when specifically asked to 'open' it. Do NOT use this for gathering information.",
+                  description: "Open a specific website or app (YouTube, Spotify, etc.) ONLY when specifically asked to 'open' it.",
                   parameters: {
                     type: Type.OBJECT,
                     properties: {
-                      actionType: { type: Type.STRING, description: "Type of action: 'open', 'youtube', 'spotify', 'whatsapp'" },
-                      query: { type: Type.STRING, description: "The website name or search query for the specific app." },
-                      target: { type: Type.STRING, description: "The target phone number for WhatsApp, if applicable." }
+                      actionType: { type: Type.STRING, description: "Type: 'open', 'youtube', 'spotify', 'whatsapp'" },
+                      query: { type: Type.STRING, description: "The website name or search query." },
+                      target: { type: Type.STRING, description: "The target phone number for WhatsApp." }
                     },
                     required: ["actionType", "query"]
                   }
                 },
-              {
-                name: "navigatePage",
-                description: "Scroll the page or navigate history. Call this when the user says 'scroll down', 'scroll up', 'refresh', 'go back', etc.",
-                parameters: {
-                  type: Type.OBJECT,
-                  properties: {
-                    action: { type: Type.STRING, description: "The action: 'scroll_down', 'scroll_up', 'refresh', 'back', 'forward'" }
-                  },
-                  required: ["action"]
+                {
+                  name: "navigatePage",
+                  description: "Control page scrolling or history.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      action: { type: Type.STRING, description: "Action: 'scroll_down', 'scroll_up', 'refresh', 'back', 'forward'" }
+                    },
+                    required: ["action"]
+                  }
+                },
+                {
+                  name: "rememberFact",
+                  description: "Save a fact to long-term memory.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      fact: { type: Type.STRING, description: "The fact to remember." }
+                    },
+                    required: ["fact"]
+                  }
                 }
-              },
-              {
-                name: "rememberFact",
-                description: "Save a fact about Manohar to your long-term memory so you don't forget it in future sessions.",
-                parameters: {
-                  type: Type.OBJECT,
-                  properties: {
-                    fact: { type: Type.STRING, description: "The specific fact or preference to remember." }
-                  },
-                  required: ["fact"]
-                }
-              }
-            ]
-          }
-        ]
+              ]
+            }
+          ]
         },
         callbacks: {
           onopen: () => {
@@ -237,24 +237,23 @@ export class LiveSessionManager {
               this.playAudioChunk(base64Audio);
             }
 
-            // Handle Interruption
+            // Handle Interruption accurately
             if (message.serverContent?.interrupted) {
+              console.log("Zoro interrupted by Manohar");
               this.stopPlayback(true);
               this.onStateChange("listening");
             }
 
-            // Handle Transcriptions (Zoro's response text)
+            // Handle Transcriptions
             const modelText = message.serverContent?.modelTurn?.parts?.[0]?.text;
             if (modelText) {
                this.onMessage("zoro", modelText);
             }
 
-            // Handle User Transcriptions (What Zoro thinks Manohar said)
+            // Handle User Transcriptions (Debugging)
             const userTranscript = (message as any).serverContent?.inputAudioTranscription?.transcript;
             if (userTranscript) {
-              console.log("User Transcript:", userTranscript);
-              // We don't necessarily want to push every interim transcript to the chat window 
-              // as it's noisy, but we can log it or show it in a "draft" state.
+              console.log("Manohar said (transcript):", userTranscript);
             }
 
             // Handle Function Calls
