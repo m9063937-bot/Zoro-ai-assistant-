@@ -1,0 +1,7 @@
+{
+  "name": "Zoro AI Assistant",
+  "description": "A sassy, witty, and intelligent Indian female AI voice assistant speaking Telugu with Rajahmundry/Kakinada slang.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
