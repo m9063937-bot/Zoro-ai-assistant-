@@ -1,0 +1,35 @@
+{
+  "entities": {
+    "memory": {
+      "title": "User Memory",
+      "description": "Stores persistent facts and context about the user (Manohar) and previous interactions.",
+      "type": "object",
+      "properties": {
+        "key": { "type": "string", "description": "The type of fact (e.g., 'birthday', 'preference', 'project')" },
+        "value": { "type": "string", "description": "The value of the fact" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["key", "value", "updatedAt"]
+    },
+    "conversationHighlights": {
+      "title": "Conversation Highlights",
+      "description": "Stores summaries of previous conversations for long-term memory.",
+      "type": "object",
+      "properties": {
+        "summary": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["summary", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/memories/{memoryId}": {
+      "schema": "memory",
+      "description": "Collection of user-specific facts."
+    },
+    "/highlights/{highlightId}": {
+      "schema": "conversationHighlights",
+      "description": "Collection of conversation summaries."
+    }
+  }
+}

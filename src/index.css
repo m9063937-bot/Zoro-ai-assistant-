@@ -4,14 +4,6 @@
 @theme {
   --font-sans: "Rajdhani", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Share Tech Mono", ui-monospace, SFMono-Regular, monospace;
-
-  --animate-spin-slow: spin 12s linear infinite;
-  --animate-spin-slow-reverse: spin-reverse 15s linear infinite;
-
-  @keyframes spin-reverse {
-    from { transform: rotate(360deg); }
-    to { transform: rotate(0deg); }
-  }
 }
 
 html, body, #root {

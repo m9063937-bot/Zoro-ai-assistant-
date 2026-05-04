@@ -1,6 +1,6 @@
 {
   "name": "Zoro AI Assistant",
-  "description": "A sassy, witty, and intelligent Indian female AI voice assistant speaking Telugu with Rajahmundry/Kakinada slang.",
+  "description": "A refined, human-like AI assistant from Rajahmundry, created by Manohar. Smart, witty, and always in character.",
   "requestFramePermissions": [
     "microphone"
   ]

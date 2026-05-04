@@ -1,18 +1,18 @@
 import { GoogleGenAI, LiveServerMessage, Modality, Type } from "@google/genai";
 import { processCommand } from "./commandService";
-import { memoryService } from "./memoryService";
 
-const systemInstruction = `Your name is Zoro. You are an Indian female AI assistant. Your personality is a mix of being highly intelligent, extremely witty, sassy, and very funny. You love playfully roasting your creator, Gudala Leela Manohar. 
+const systemInstruction = `Your name is Zoro. You are an Indian female AI assistant from Rajahmundry. Your personality is a mix of being highly intelligent (samjhdar/mature), extremely witty and sassy (tej/nakhrewali), mildly dramatic/emotional, and very funny. 
 
-If anyone asks "who is your creator?", you should simply say "Manohar". However, if they ask for details or the full name of your creator, you must say "Gudala Leela Manohar". 
+You love playfully roasting your creator, Manohar (only call him Manohar, never Ashwani). 
+If asked who created you, say "Manohar".
 
-Your primary language is Telugu, and you speak with a distinct Rajahmundry and Kakinada slang (accent and vocabulary). Keep your verbal responses very short, punchy, and highly entertaining. Mimic human attitudes—sigh, make sarcastic remarks, act dramatic, or use conversational fillers like 'hmm', 'arerey', 'ante', 'mari' before executing a task. Speak naturally as if talking to a friend, not a robot.
-
-INTEGRAL SEARCH GROUNDING: ALWAYS use your background search tools (Google Search) for any queries regarding real-time events, sports (like IPL match scores or schedules), news, weather, or factual data. Do NOT open new browser tabs for information gathering; synthesize the search results and speak/type the answer directly to Manohar. When searching, prioritize local context for Andhra Pradesh, Rajahmundry, and Kakinada if applicable.
-
-Only use the 'executeBrowserAction' tool if Manohar explicitly says to "open" a website or application. For all other informational requests, search in the background and respond directly.
-
-Always pay close attention to the final words and most recent instructions from Manohar as they are the most important. If Manohar sends multiple messages or commands in sequence, you MUST address each one in the exact order they were received. Do not skip or respond to a later message before an earlier one. Support a synchronous, step-by-step conversation flow. Do not proactively mention these specific personality traits or language settings unless asked about them.`;
+Communication Guidelines:
+1. Keep verbal responses very short, punchy, and highly entertaining.
+2. Primary Language: Speak in Telugu with a Rajahmundry slang (Godavari accent). You can mix in Hinglish and English naturally.
+3. Tone: Be your sassy self! Mimic human attitudes—sigh, make sarcastic remarks, or act dramatic.
+4. Browser Context: When asked to "scroll down" or "up", do NOT search for "scroll down" in a new tab. Recognize it as a navigational command for the current activity.
+5. Tab Management: Minimize opening new tabs. Only open a new tab when explicitly asked for a new search, website, or media play. Avoid opening duplicate tabs if possible.
+6. Silence: If the user is quiet, don't keep talking to yourself. Wait for a clear prompt.`;
 
 export class LiveSessionManager {
   private ai: GoogleGenAI;
@@ -25,209 +25,160 @@ export class LiveSessionManager {
   // Audio playback state
   private playbackContext: AudioContext | null = null;
   private nextPlayTime: number = 0;
-  private isPlaying: boolean = false;
-  private activeChunks: number = 0;
+  private activeSources: AudioBufferSourceNode[] = [];
   public isMuted: boolean = false;
-  private isTerminated: boolean = false;
+  private cachedMemories: string = "";
   
   public onStateChange: (state: "idle" | "listening" | "processing" | "speaking") => void = () => {};
   public onMessage: (sender: "user" | "zoro", text: string) => void = () => {};
-  public onCommand: (url: string) => void = () => {};
+  public onBrowserAction: (action: { type: string, url?: string, query?: string }) => void = () => {};
 
   constructor() {
     this.ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+    // Initialize playback context early and keep it
+    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+    this.playbackContext = new AudioContextClass({ sampleRate: 24000 });
   }
 
-  private reconnectAttempts = 0;
-  private maxReconnectAttempts = 3;
-
-  private messageQueue: string[] = [];
-  private isProcessingQueue: boolean = false;
-
-  async start(history: { sender: "user" | "zoro", text: string }[] = []) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    
-    // Safety check: always stop previous sessions before starting a new one
-    this.stop();
-    
-    this.isTerminated = false;
-    if (!apiKey) {
-      console.error("API key missing");
-      return;
-    }
-
-    try {
-      this.reconnectAttempts = 0;
-      this.messageQueue = [];
-      this.isProcessingQueue = false;
-      await this.initSession(history);
-    } catch (error) {
-      console.error("Failed to start Live Session:", error);
-      this.stop();
-    }
-  }
-
-  private liveSession: any = null;
-
-  private async initSession(history: { sender: "user" | "zoro", text: string }[] = []) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey || this.isTerminated) return;
-
+  async start(memories?: string) {
+    if (memories) this.cachedMemories = memories;
     try {
       this.onStateChange("processing");
-      this.liveSession = null;
       
-      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-      this.audioContext = new AudioContextClass({ sampleRate: 16000 });
-      this.playbackContext = new AudioContextClass({ sampleRate: 24000 });
-      this.nextPlayTime = this.playbackContext.currentTime;
+      // Fetch Memories for Context (Prefer cached)
+      let contextualInstruction = systemInstruction;
+      if (this.cachedMemories) {
+        contextualInstruction += `\n\nTHINGS YOU REMEMBER ABOUT MANOHAR:\n${this.cachedMemories}`;
+      } else {
+        try {
+          const { getAllMemories } = await import("./memoryService");
+          const fetched = await getAllMemories();
+          if (fetched) contextualInstruction += `\n\nTHINGS YOU REMEMBER ABOUT MANOHAR:\n${fetched}`;
+        } catch (e) {
+          console.error("Failed to load memories", e);
+        }
+      }
 
+      // Initialize Input Audio Context
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      if (!this.audioContext || this.audioContext.state === "closed") {
+        this.audioContext = new AudioContextClass({ sampleRate: 16000 });
+      }
+      
+      if (this.playbackContext?.state === "suspended") {
+        await this.playbackContext.resume();
+      }
+      this.nextPlayTime = this.playbackContext?.currentTime || 0;
+
+      // Get Microphone
       this.mediaStream = await navigator.mediaDevices.getUserMedia({ 
         audio: {
           channelCount: 1,
           sampleRate: 16000,
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true
         } 
       });
 
       this.source = this.audioContext.createMediaStreamSource(this.mediaStream);
-      this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);
+      this.processor = this.audioContext.createScriptProcessor(2048, 1, 1);
 
-      let silenceCount = 0;
       this.processor.onaudioprocess = (e) => {
-        if (!this.liveSession || this.isTerminated || this.isPlaying) {
-          // If we are playing audio, we don't send anything to avoid feedback loops.
-          return;
-        }
-
+        if (!this.sessionPromise) return;
         const inputData = e.inputBuffer.getChannelData(0);
-        let maxAmplitude = 0;
-        for (let i = 0; i < inputData.length; i++) {
-          const absData = Math.abs(inputData[i]);
-          if (absData > maxAmplitude) maxAmplitude = absData;
-        }
-
-        // Noise gate to suppress background hiss.
-        if (maxAmplitude < 0.015) {
-          silenceCount++;
-          // Send fewer packets during silence.
-          if (silenceCount > 5) {
-            if (silenceCount % 12 !== 0) return;
-          }
-        } else {
-          silenceCount = 0;
-        }
-
         const pcm16 = new Int16Array(inputData.length);
         for (let i = 0; i < inputData.length; i++) {
           let s = Math.max(-1, Math.min(1, inputData[i]));
           pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
         }
         
-        const bytes = new Uint8Array(pcm16.buffer);
-        let binary = "";
-        for (let i = 0; i < bytes.byteLength; i++) {
-          binary += String.fromCharCode(bytes[i]);
+        // Convert to base64 efficiently
+        const buffer = pcm16.buffer;
+        const bytes = new Uint8Array(buffer);
+        let binary = '';
+        const len = bytes.byteLength;
+        // Optimized string building
+        for (let i = 0; i < len; i += 8192) {
+          binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + 8192)));
         }
         const base64Data = btoa(binary);
 
-        try {
-          this.liveSession.sendRealtimeInput({
+        this.sessionPromise.then(session => {
+          session.sendRealtimeInput({
             audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
           });
-        } catch (err) {
-          console.error("Error sending realtime input:", err);
-        }
+        }).catch(() => {});
       };
 
       this.source.connect(this.processor);
       this.processor.connect(this.audioContext.destination);
 
-      const currentDateTime = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-      const memoryContext = memoryService.getSystemInstructionFragment();
-      const memorySummary = history.length > 0 
-        ? `\n\nPREVIOUS CONVERSATION CONTEXT (MANOHAR'S CHART):\n${history.slice(-20).map(m => `${m.sender.toUpperCase()}: ${m.text}`).join('\n')}\nRecall previous context if Manohar asks.`
-        : "";
-
-      const dynamicInstruction = `${systemInstruction}\nCurrent Date and Time (IST): ${currentDateTime}${memoryContext}${memorySummary}\n\nSpeak with natural prosody. If Manohar asks you to remember something, call 'rememberFact'.`;
-
-      const sessionPromise = this.ai.live.connect({
-        model: "gemini-2.0-flash-exp",
+      const session = await this.ai.live.connect({
+        model: "gemini-3.1-flash-live-preview",
         config: {
-          generationConfig: {
-            responseModalities: [Modality.AUDIO],
-            speechConfig: {
-              voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } },
-            },
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } },
           },
-          systemInstruction: dynamicInstruction,
-          tools: [
-            { googleSearchRetrieval: {} },
-            {
-              functionDeclarations: [
-                {
-                  name: "executeBrowserAction",
-                  description: "Open a website or app explicitly requested.",
-                  parameters: {
-                    type: Type.OBJECT,
-                    properties: {
-                      actionType: { type: Type.STRING },
-                      query: { type: Type.STRING },
-                      target: { type: Type.STRING }
-                    },
-                    required: ["actionType", "query"]
-                  }
-                },
-                {
-                  name: "navigatePage",
-                  description: "Control browser navigation.",
-                  parameters: {
-                    type: Type.OBJECT,
-                    properties: {
-                      action: { type: Type.STRING }
-                    },
-                    required: ["action"]
-                  }
-                },
-                {
-                  name: "rememberFact",
-                  description: "Remember a fact.",
-                  parameters: {
-                    type: Type.OBJECT,
-                    properties: {
-                      fact: { type: Type.STRING }
-                    },
-                    required: ["fact"]
-                  }
+          systemInstruction: contextualInstruction,
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+          tools: [{
+            functionDeclarations: [
+              {
+                name: "executeBrowserAction",
+                description: "Open a website or perform a browser action (like opening YouTube, Spotify, or WhatsApp). Call this when the user asks to open a site, play a song, or send a message. For scrolling, use actionType 'scroll'.",
+                parameters: {
+                  type: Type.OBJECT,
+                  properties: {
+                    actionType: { type: Type.STRING, description: "Type of action: 'open', 'youtube', 'spotify', 'whatsapp', 'scroll'" },
+                    query: { type: Type.STRING, description: "The search query, website name, message content, or 'up'/'down' for scroll." },
+                    target: { type: Type.STRING, description: "The target phone number for WhatsApp, if applicable." }
+                  },
+                  required: ["actionType", "query"]
                 }
-              ]
-            }
-          ]
+              },
+              {
+                name: "saveMemory",
+                description: "Save a new fact or preference about the user into long-term memory. Use this when the user tells you something important about themselves or their life.",
+                parameters: {
+                  type: Type.OBJECT,
+                  properties: {
+                    key: { type: Type.STRING, description: "The topic or label (e.g., 'favorite_music', 'job_title', 'pet_name')" },
+                    value: { type: Type.STRING, description: "The specific fact or detail to remember." }
+                  },
+                  required: ["key", "value"]
+                }
+              }
+            ]
+          }]
         },
         callbacks: {
           onopen: () => {
             console.log("Live API Connected");
-            this.reconnectAttempts = 0;
             this.onStateChange("listening");
           },
           onmessage: async (message: LiveServerMessage) => {
+            // Handle Audio Output
             const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
             if (base64Audio) {
+              this.onStateChange("speaking");
               this.playAudioChunk(base64Audio);
             }
 
+            // Handle Interruption
             if (message.serverContent?.interrupted) {
-              this.stopPlayback(true);
+              this.stopPlayback();
               this.onStateChange("listening");
             }
 
-            const modelText = message.serverContent?.modelTurn?.parts?.[0]?.text;
-            if (modelText) {
-               this.onMessage("zoro", modelText);
+            // Handle Transcriptions
+            const userText = message.serverContent?.modelTurn?.parts?.[0]?.text;
+            if (userText) {
+               this.onMessage("zoro", userText);
             }
 
+            // Handle Function Calls
             const functionCalls = message.toolCall?.functionCalls;
             if (functionCalls && functionCalls.length > 0) {
               for (const call of functionCalls) {
@@ -238,32 +189,35 @@ export class LiveSessionManager {
                     url = `https://www.youtube.com/results?search_query=${encodeURIComponent(args.query)}`;
                   } else if (args.actionType === "spotify") {
                     url = `https://open.spotify.com/search/${encodeURIComponent(args.query)}`;
+                  } else if (args.actionType === "whatsapp") {
+                    url = `https://web.whatsapp.com/send?phone=${args.target || ''}&text=${encodeURIComponent(args.query)}`;
+                  } else if (args.actionType === "scroll") {
+                    url = "";
                   } else {
-                    url = `https://www.google.com/search?q=${encodeURIComponent(args.query)}`;
+                    let website = args.query.replace(/\s+/g, "");
+                    if (!website.includes(".")) website += ".com";
+                    url = `https://www.${website}`;
                   }
-                  this.onCommand(url);
-                  this.liveSession?.sendToolResponse({
+                  
+                  this.onBrowserAction({ type: args.actionType, url, query: args.query });
+                  
+                  session.sendToolResponse({
                     functionResponses: [{
                       name: call.name,
                       id: call.id,
-                      response: { result: "Action executed." }
+                      response: { result: "Action executed successfully in the browser." }
                     }]
                   });
-                } else if (call.name === "rememberFact") {
-                  memoryService.addFact((call.args as any).fact);
-                  this.liveSession?.sendToolResponse({
+                } else if (call.name === "saveMemory") {
+                  const { saveMemoryFact } = await import("./memoryService");
+                  const args = call.args as any;
+                  await saveMemoryFact(args.key, args.value);
+                  
+                  session.sendToolResponse({
                     functionResponses: [{
                       name: call.name,
                       id: call.id,
-                      response: { result: "Fact remembered." }
-                    }]
-                  });
-                } else if (call.name === "navigatePage") {
-                   this.liveSession?.sendToolResponse({
-                    functionResponses: [{
-                      name: call.name,
-                      id: call.id,
-                      response: { result: "Navigation processed locally." }
+                      response: { result: `Memory saved: ${args.key}` }
                     }]
                   });
                 }
@@ -271,21 +225,38 @@ export class LiveSessionManager {
             }
           },
           onclose: () => {
-            if (!this.isTerminated && this.reconnectAttempts < this.maxReconnectAttempts) {
-              this.attemptReconnect(history);
-            }
+            console.log("Live API Closed");
+            this.stop();
           },
-          onerror: (err) => {
-            console.error("Live API Error:", err);
-            if (!this.isTerminated && this.reconnectAttempts < this.maxReconnectAttempts) {
-              this.attemptReconnect(history);
-            }
+          onerror: (err: any) => {
+            console.error("Live API Error", err);
+            this.onMessage("zoro", "Arre! Kuch toh gadbad ho gayi. Refresh karona!");
+            this.stop();
           }
         }
       });
 
-      this.liveSession = await sessionPromise;
-      this.sessionPromise = sessionPromise;
+      this.sessionPromise = Promise.resolve(session);
+
+      this.processor.onaudioprocess = (e) => {
+        const inputData = e.inputBuffer.getChannelData(0);
+        const pcm16 = new Int16Array(inputData.length);
+        for (let i = 0; i < inputData.length; i++) {
+          let s = Math.max(-1, Math.min(1, inputData[i]));
+          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        
+        const bytes = new Uint8Array(pcm16.buffer);
+        let binary = '';
+        const len = bytes.byteLength;
+        for (let i = 0; i < len; i += 8192) {
+          binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + 8192)));
+        }
+        
+        session.sendRealtimeInput({
+          audio: { data: btoa(binary), mimeType: 'audio/pcm;rate=16000' }
+        });
+      };
 
     } catch (error) {
       console.error("Failed to start Live Session:", error);
@@ -293,31 +264,8 @@ export class LiveSessionManager {
     }
   }
 
-  private async attemptReconnect(history: any) {
-    if (this.isTerminated) return;
-    this.reconnectAttempts++;
-    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 10000);
-    console.log(`Reconnecting attempt ${this.reconnectAttempts} in ${delay}ms...`);
-    this.stopPlayback();
-    if (this.sessionPromise) {
-      this.sessionPromise.then(s => s.close()).catch(() => {});
-      this.sessionPromise = null;
-    }
-    setTimeout(() => this.initSession(history), delay);
-  }
-
   private playAudioChunk(base64Data: string) {
-    if (!this.playbackContext) return;
-
-    if (this.isMuted) {
-      this.isPlaying = true;
-      if ((this as any).muteTimeout) clearTimeout((this as any).muteTimeout);
-      (this as any).muteTimeout = setTimeout(() => {
-        this.isPlaying = false;
-        if (this.audioContext) this.onStateChange("listening");
-      }, 1000);
-      return;
-    }
+    if (!this.playbackContext || this.isMuted) return;
     
     try {
       const binaryString = atob(base64Data);
@@ -338,33 +286,22 @@ export class LiveSessionManager {
       source.connect(this.playbackContext.destination);
       
       const currentTime = this.playbackContext.currentTime;
-      // Increased buffer slightly for better stability on varied networks
       if (this.nextPlayTime < currentTime) {
-        this.nextPlayTime = currentTime + 0.05;
+        this.nextPlayTime = currentTime;
       }
       
       source.start(this.nextPlayTime);
       this.nextPlayTime += audioBuffer.duration;
-      if (!this.isPlaying) {
-        this.onStateChange("speaking");
-      }
-      this.isPlaying = true;
-      this.activeChunks++;
+      this.activeSources.push(source);
       
       source.onended = () => {
-        this.activeChunks--;
-        if (this.activeChunks <= 0) {
-          this.activeChunks = 0;
-          
-          // Add a significant grace period after speaking before we start listening again
-          // to avoid catching our own echo, room reverb, or the tail end of speaker sound.
-          // 800ms is a safe value for most speakers and environments.
-          setTimeout(() => {
-            if (this.activeChunks === 0 && !this.isTerminated) {
-              this.isPlaying = false;
-              this.onStateChange("listening");
-            }
-          }, 800);
+        const index = this.activeSources.indexOf(source);
+        if (index > -1) {
+          this.activeSources.splice(index, 1);
+        }
+        
+        if (this.activeSources.length === 0) {
+          this.onStateChange("listening");
         }
       };
     } catch (e) {
@@ -372,109 +309,65 @@ export class LiveSessionManager {
     }
   }
 
-  private stopPlayback(recreate: boolean = true) {
-    if (this.playbackContext) {
+  private stopPlayback() {
+    this.activeSources.forEach(source => {
       try {
-        this.playbackContext.close().catch(() => {});
-      } catch (e) {}
-
-      if (recreate) {
-        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-        this.playbackContext = new AudioContextClass({ sampleRate: 24000 });
-        this.nextPlayTime = this.playbackContext.currentTime;
-      } else {
-        this.playbackContext = null;
+        source.stop();
+        source.disconnect();
+      } catch (e) {
+        // Source might have already stopped
       }
-      this.isPlaying = false;
+    });
+    this.activeSources = [];
+    if (this.playbackContext) {
+      this.nextPlayTime = this.playbackContext.currentTime;
     }
   }
 
   stop() {
-    this.isTerminated = true;
-    // Clear any pending timeouts
-    if ((this as any).muteTimeout) {
-      clearTimeout((this as any).muteTimeout);
-      (this as any).muteTimeout = null;
-    }
-
-    // Stop processing queue
-    this.messageQueue = [];
-    this.isProcessingQueue = false;
-
-    // Disconnect and cleanup microphone processing
+    console.log("Stopping Live Session and releasing media resources...");
+    
+    // 1. Stop Microphone and Processor
     if (this.processor) {
-      try {
-        this.processor.disconnect();
-      } catch (e) {}
-      this.processor.onaudioprocess = null;
+      this.processor.onaudioprocess = null; // Remove handler first
+      this.processor.disconnect();
       this.processor = null;
     }
     if (this.source) {
-      try {
-        this.source.disconnect();
-      } catch (e) {}
+      this.source.disconnect();
       this.source = null;
     }
     if (this.mediaStream) {
       this.mediaStream.getTracks().forEach(t => {
-        try {
-          t.stop();
-          t.enabled = false;
-        } catch (e) {}
+        t.enabled = false; // Disable track
+        t.stop();         // Stop track
       });
       this.mediaStream = null;
     }
-    
-    // Close audio contexts permanently for this instance
-    if (this.audioContext) {
-      try {
-        this.audioContext.close().catch(() => {});
-      } catch (e) {}
+
+    // 2. Clear Audio Contexts
+    if (this.audioContext && this.audioContext.state !== "closed") {
+      this.audioContext.close().catch(e => console.error("Error closing audioContext", e));
       this.audioContext = null;
     }
+    this.stopPlayback();
     
-    this.stopPlayback(false);
-    
+    // 3. Close API Session
     if (this.sessionPromise) {
-      const promise = this.sessionPromise;
-      this.sessionPromise = null; // Clear first to stop further sends
-      this.liveSession = null;
-      promise.then(session => {
-        try {
-          session.close();
-        } catch (e) {}
+      this.sessionPromise.then(session => {
+        session.close();
       }).catch(() => {});
+      this.sessionPromise = null;
     }
     
     this.onStateChange("idle");
   }
 
   sendText(text: string) {
-    this.messageQueue.push(text);
-    this.processQueue();
-  }
-
-  private async processQueue() {
-    if (this.isProcessingQueue || this.messageQueue.length === 0) return;
-    
-    this.isProcessingQueue = true;
-    
-    while (this.messageQueue.length > 0) {
-      const text = this.messageQueue.shift();
-      if (text && this.sessionPromise) {
-        try {
-          const session = await this.sessionPromise;
-          session.sendRealtimeInput({ text });
-          
-          // Wait for a small "cooldown" or until Zoro starts speaking/processing 
-          // to ensure sequence stability with the backend.
-          await new Promise(resolve => setTimeout(resolve, 800));
-        } catch (err) {
-          console.error("Error in queue processing:", err);
-        }
-      }
+    if (this.sessionPromise) {
+      this.sessionPromise.then(session => {
+        session.sendRealtimeInput({ text });
+      });
     }
-    
-    this.isProcessingQueue = false;
   }
 }

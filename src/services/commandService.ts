@@ -1,57 +1,54 @@
-import { GoogleGenAI } from "@google/genai";
-
-export async function smartProcessCommand(command: string): Promise<CommandResponse> {
-  // First, try standard regex for speed
-  const regexResult = processCommand(command);
-  if (regexResult.isBrowserAction) return regexResult;
-
-  // Fallback to Gemini for complex intent detection
-  try {
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-    
-    const prompt = `You are a command parser. Analyze this user request: "${command}"
-    Return a JSON object with:
-    {
-      "action": "description of what you are doing",
-      "url": "the URL to open if applicable",
-      "isBrowserAction": boolean,
-      "isLocal": boolean (for scrolling/refreshing)
-    }
-    If no action found, return isBrowserAction: false.
-    Support: opening websites, youtube search, spotify search, whatsapp message, scrolling, refreshing, navigation.`;
-
-    const result = await ai.models.generateContent({
-      model: "gemini-1.5-flash",
-      contents: [{ role: "user", parts: [{ text: prompt }] }]
-    });
-    const text = result.text || "";
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
-    }
-  } catch (e) {
-    console.error("Smart command parsing failed", e);
-  }
-
-  return { action: "", isBrowserAction: false };
-}
-
-export function processCommand(command: string): CommandResponse {
+export function processCommand(command: string): {
+  action: string;
+  url?: string;
+  isBrowserAction: boolean;
+} {
   const lowerCmd = command.toLowerCase().trim();
 
-  // General Browsing: "Open [website name]"
+  // Navigation: "Scroll up/down" 
+  if (lowerCmd.match(/^(scroll\s+(up|down)|scroll)$/)) {
+    return {
+      action: `Got it! Scrolling ${lowerCmd.includes("up") ? "up" : "down"} for you.`,
+      isBrowserAction: false,
+    };
+  }
+
+  // General App Opening: "Open [app name]"
   const openMatch = lowerCmd.match(/^open\s+(.+)$/);
-  if (
-    openMatch &&
-    !lowerCmd.includes("youtube") &&
-    !lowerCmd.includes("spotify")
-  ) {
+  if (openMatch) {
+    const appName = openMatch[1].trim().toLowerCase();
+    
+    // Mobile Deep Links or App-Specific URLs
+    const appLinks: Record<string, string> = {
+      instagram: "https://www.instagram.com/",
+      facebook: "https://www.facebook.com/",
+      twitter: "https://twitter.com/",
+      x: "https://twitter.com/",
+      whatsapp: "https://web.whatsapp.com/",
+      camera: "camera://",
+      phone: "tel:",
+      sms: "sms:",
+      calculator: "calculator://",
+      spotify: "https://open.spotify.com/",
+      youtube: "https://www.youtube.com/",
+      map: "https://maps.google.com/",
+      gmail: "https://mail.google.com/",
+    };
+
+    if (appLinks[appName]) {
+      return {
+        action: `Opening ${appName} for you. Kya dekhoge waha, Manohar?`,
+        url: appLinks[appName],
+        isBrowserAction: true,
+      };
+    }
+
     let website = openMatch[1].trim().replace(/\s+/g, "");
     if (!website.includes(".")) {
       website += ".com";
     }
     return {
-      action: `Opening ${openMatch[1]} for you, ugh.`,
+      action: `Opening ${openMatch[1]} web version. Thoda sabar rakho!`,
       url: `https://www.${website}`,
       isBrowserAction: true,
     };
@@ -93,29 +90,5 @@ export function processCommand(command: string): CommandResponse {
     };
   }
 
-  // Local Navigation Commands
-  if (lowerCmd.includes("scroll down")) {
-    return { action: "scrolling_down", isBrowserAction: true, isLocal: true };
-  }
-  if (lowerCmd.includes("scroll up")) {
-    return { action: "scrolling_up", isBrowserAction: true, isLocal: true };
-  }
-  if (lowerCmd.includes("refresh") || lowerCmd.includes("reload")) {
-    return { action: "refreshing", isBrowserAction: true, isLocal: true };
-  }
-  if (lowerCmd.includes("go back")) {
-    return { action: "going_back", isBrowserAction: true, isLocal: true };
-  }
-  if (lowerCmd.includes("go forward")) {
-    return { action: "going_forward", isBrowserAction: true, isLocal: true };
-  }
-
   return { action: "", isBrowserAction: false };
-}
-
-export interface CommandResponse {
-  action: string;
-  url?: string;
-  isBrowserAction: boolean;
-  isLocal?: boolean;
 }
